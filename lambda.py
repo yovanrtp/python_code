@@ -5,22 +5,50 @@ import time
 import boto3
 from botocore.exceptions import ClientError
 
-def create_lambda_deployment_package(target_runtime):
-    """Creates an in-memory zip file containing a compliant Python handler displaying the runtime."""
-    lambda_code = f'''
-import json
-import sys
+# Define list of deprecated/EOL runtimes
+DEPRECATED_RUNTIMES = [
+    'nodejs10.x', 'nodejs12.x', 'nodejs14.x',
+    'python3.6', 'python3.7', 'python3.8',
+    'java8', 'dotnetcore3.1', 'ruby2.7'
+]
 
+def audit_and_block_deprecated_runtimes(lambda_client):
+    """
+    Scans all existing Lambda functions in the account/region and 
+    checks for deprecated or EOL runtimes.
+    """
+    print("🔍 Auditing existing Lambda functions for deprecated runtimes...")
+    paginator = lambda_client.get_paginator('list_functions')
+    deprecated_found = []
+
+    for page in paginator.paginate():
+        for fn in page['Functions']:
+            func_name = fn['FunctionName']
+            runtime = fn.get('Runtime', 'Unknown')
+            
+            if runtime in DEPRECATED_RUNTIMES:
+                deprecated_found.append({
+                    'FunctionName': func_name,
+                    'Runtime': runtime
+                })
+                print(f"⚠️ [DEPRECATED RUNTIME DETECTED] Function: '{func_name}' is using runtime '{runtime}'")
+
+    if deprecated_found:
+        print(f"\n❌ Audit Warning: Found {len(deprecated_found)} function(s) using deprecated runtimes.")
+        # Optional: Uncomment the line below to strictly block deployment if EOL runtimes exist
+        # raise Exception("Deployment blocked: Deprecated Lambda runtimes detected in account!")
+    else:
+        print("✅ Fleet Audit Passed: No deprecated Lambda runtimes found.")
+
+def create_lambda_deployment_package():
+    """Creates an in-memory zip file containing a compliant Python handler."""
+    lambda_code = '''
 def lambda_handler(event, context):
     print("Received event: ", event)
-    runtime_info = "{target_runtime} (Python " + str(sys.version_info.major) + "." + str(sys.version_info.minor) + "." + str(sys.version_info.micro) + ")"
-    return {{
+    return {
         'statusCode': 200,
-        'headers': {{
-            'Content-Type': 'text/plain'
-        }},
-        'body': 'Hello from Lambda using lambda_execution_role! Running on: ' + runtime_info
-    }}
+        'body': 'Hello from Lambda using lambda_execution_role!'
+    }
 '''
     zip_output = io.BytesIO()
     with zipfile.ZipFile(zip_output, 'w', zipfile.ZIP_DEFLATED) as zf:
@@ -92,9 +120,8 @@ def wait_for_lambda_ready(lambda_client, function_name, max_attempts=15, delay=5
     raise Exception("❌ Timed out waiting for Lambda function to become ready.")
 
 def deploy_lambda_function(lambda_client, role_arn, function_name="compliant-lambda-function"):
-    """Deploys or updates the Lambda function with robust manual state waiting and runtime upgrade."""
-    TARGET_RUNTIME = 'python3.12'  # 👈 Upgraded runtime version
-    zip_bytes = create_lambda_deployment_package(TARGET_RUNTIME)
+    """Deploys or updates the Lambda function with robust manual state waiting."""
+    zip_bytes = create_lambda_deployment_package()
     
     max_retries = 10
     delay = 6
@@ -103,16 +130,16 @@ def deploy_lambda_function(lambda_client, role_arn, function_name="compliant-lam
         try:
             response = lambda_client.create_function(
                 FunctionName=function_name,
-                Runtime=TARGET_RUNTIME,
+                Runtime='python3.9',
                 Role=role_arn,
                 Handler='lambda_function.lambda_handler',
                 Code={'ZipFile': zip_bytes},
-                Description='Lambda function using mandatory lambda_execution_role (Python 3.12)',
+                Description='Lambda function using mandatory lambda_execution_role',
                 Timeout=10,
                 MemorySize=256,
                 Publish=True
             )
-            print(f"✅ Successfully created Lambda function: {function_name} on {TARGET_RUNTIME}")
+            print(f"✅ Successfully created Lambda function: {function_name}")
             return response['FunctionArn']
             
         except ClientError as e:
@@ -123,33 +150,32 @@ def deploy_lambda_function(lambda_client, role_arn, function_name="compliant-lam
                 print(f"⏳ (Attempt {attempt}/{max_retries}) IAM role propagation in progress... waiting {delay}s...")
                 time.sleep(delay)
             elif error_code == 'ResourceConflictException':
-                print(f"ℹ️ Function {function_name} already exists. Waiting for ongoing updates to settle...")
+                print(f"ℹ️ Function {function_name} already exists. Waiting for any ongoing updates to settle...")
                 
                 wait_for_lambda_ready(lambda_client, function_name)
                 
-                print("⚙️ Updating function configuration and runtime to python3.12...")
-                lambda_client.update_function_configuration(
-                    FunctionName=function_name,
-                    Role=role_arn,
-                    Runtime=TARGET_RUNTIME,
-                    Timeout=10,
-                    MemorySize=256
-                )
-                
-                print("⏳ Waiting for configuration update to complete...")
-                wait_for_lambda_ready(lambda_client, function_name)
-                
-                print("📤 Updating function code and publishing new version...")
-                code_response = lambda_client.update_function_code(
+                print("📤 Updating function code...")
+                lambda_client.update_function_code(
                     FunctionName=function_name,
                     ZipFile=zip_bytes,
                     Publish=True
                 )
                 
                 print("⏳ Waiting for code update to complete...")
+                wait_for_lambda_ready(lambda_client, function_name)
+                
+                print("⚙️ Updating function configuration and role...")
+                lambda_client.update_function_configuration(
+                    FunctionName=function_name,
+                    Role=role_arn,
+                    Timeout=10,
+                    MemorySize=256
+                )
+                
+                print("⏳ Waiting for configuration update to complete...")
                 final_arn = wait_for_lambda_ready(lambda_client, function_name)
                 
-                print(f"✅ Successfully updated Lambda function: {function_name} to {TARGET_RUNTIME}")
+                print(f"✅ Successfully updated Lambda function: {function_name}")
                 return final_arn
             else:
                 raise e
@@ -157,44 +183,26 @@ def deploy_lambda_function(lambda_client, role_arn, function_name="compliant-lam
     raise Exception("❌ Timed out waiting for IAM role propagation or Lambda update.")
 
 def configure_api_gateway(api_client, lambda_client, function_arn, function_name="compliant-lambda-function", api_name="compliant-lambda-api"):
-    """Creates or updates an API Gateway HTTP API and integrates it with the Lambda function."""
+    """Creates an API Gateway HTTP API and integrates it with the Lambda function."""
     try:
         sts_client = boto3.client('sts')
         account_id = sts_client.get_caller_identity()['Account']
         
-        existing_apis = api_client.get_apis()['Items']
-        api_id = None
-        api_endpoint = None
-        
-        for api in existing_apis:
-            if api['Name'] == api_name:
-                api_id = api['ApiId']
-                api_endpoint = api['ApiEndpoint']
-                print(f"ℹ️ Found existing API Gateway: {api_name} ({api_endpoint})")
-                # Update target to point to latest function ARN/version
-                api_client.update_api(
-                    ApiId=api_id,
-                    Target=function_arn
-                )
-                print(f"✅ Updated API Gateway target.")
-                break
-        
-        if not api_id:
-            api_response = api_client.create_api(
-                Name=api_name,
-                ProtocolType='HTTP',
-                Target=function_arn
-            )
-            api_id = api_response['ApiId']
-            api_endpoint = api_response['ApiEndpoint']
-            print(f"✅ Created API Gateway HTTP API: {api_name} ({api_endpoint})")
+        api_response = api_client.create_api(
+            Name=api_name,
+            ProtocolType='HTTP',
+            Target=function_arn
+        )
+        api_id = api_response['ApiId']
+        api_endpoint = api_response['ApiEndpoint']
+        print(f"✅ Created API Gateway HTTP API: {api_name} ({api_endpoint})")
 
         source_arn = f"arn:aws:execute-api:us-east-1:{account_id}:{api_id}/*/*"
         
         try:
             lambda_client.add_permission(
                 FunctionName=function_name,
-                StatementId=f'AllowExecutionFromAPIGateway-{int(time.time())}',
+                StatementId='AllowExecutionFromAPIGateway',
                 Action='lambda:InvokeFunction',
                 Principal='apigateway.amazonaws.com',
                 SourceArn=source_arn
@@ -221,12 +229,15 @@ if __name__ == "__main__":
     iam_client = boto3.client('iam')
     api_client = boto3.client('apigatewayv2')
 
-    print("🚀 Starting Compliant AWS Lambda Deployment with Python 3.12 & API Gateway...")
+    print("🚀 Starting Compliant AWS Lambda Deployment with API Gateway...")
+
+    # Step 0: Audit account for EOL/Deprecated runtimes
+    audit_and_block_deprecated_runtimes(lambda_client)
 
     # Step 1: Get or create the exact mandatory role name
     role_arn = get_existing_lambda_execution_role(iam_client, MANDATORY_ROLE_NAME)
 
-    # Step 2: Deploy Lambda function (Python 3.12)
+    # Step 2: Deploy Lambda function
     function_arn = deploy_lambda_function(lambda_client, role_arn, FUNCTION_NAME)
 
     # Step 3: Configure API Gateway HTTP API Integration

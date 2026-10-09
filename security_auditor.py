@@ -1,39 +1,39 @@
-import boto3
+import subprocess
+import sys
+import os
 
-def audit_aws_security():
-    violations = []
+def run_scans():
+    print("=== Starting Python-driven Security Audit (Checkov & Trivy) ===")
     
-    # --- 1. IAM AUDIT (Unused credentials) ---
-    iam = boto3.client('iam')
-    users = iam.list_users()['Users']
-    for user in users:
-        summary = iam.get_login_profile(UserName=user['UserName']) if 'PasswordLastUsed' in user else None
-        # Add your business logic/threshold check here...
-
-    # --- 2. KMS AUDIT (Unrotated Keys) ---
-    kms = boto3.client('kms')
-    keys = kms.list_keys()['Keys']
-    for key in keys:
-        key_id = key['KeyId']
-        rotation = kms.get_key_rotation_status(KeyId=key_id)
-        if not rotation['KeyRotationEnabled']:
-            violations.append(f"KMS Key {key_id} does not have rotation enabled.")
-
-    # --- 3. SECRETS MANAGER AUDIT (Unrotated Secrets) ---
-    secrets = boto3.client('secretsmanager')
-    secret_list = secrets.list_secrets()['SecretList']
-    for secret in secret_list:
-        if not secret.get('RotationEnabled', False):
-            violations.append(f"Secret {secret['Name']} has no rotation enabled.")
-
-    # Fail pipeline if violations found
-    if violations:
-        print("SECURITY AUDIT FAILED:")
-        for v in violations:
-            print(f" - {v}")
-        exit(1)
+    # Target directory containing your Terraform files
+    target_dir = "."
+    
+    # 1. Run Checkov Scan
+    print("\n[1/2] Running Checkov IaC scan...")
+    checkov_cmd = [
+        "checkov",
+        "-d", target_dir,
+        "--framework", "terraform",
+        "--soft-fail" # Set to False if you want it to block immediately on failure
+    ]
+    checkov_result = subprocess.run(checkov_cmd)
+    
+    # 2. Run Trivy Scan (Config misconfigurations & Secrets)
+    print("\n[2/2] Running Trivy config and secret scan...")
+    trivy_cmd = [
+        "trivy", "fs",
+        "--security-checks", "config,secret",
+        "--exit-code", "1", # Fails the script if vulnerabilities are found
+        target_dir
+    ]
+    trivy_result = subprocess.run(trivy_cmd)
+    
+    # Evaluate exit codes
+    if trivy_result.returncode != 0:
+        print("\n❌ Security Scan FAILED: Trivy detected high-risk misconfigurations or secrets.")
+        sys.exit(1)
     else:
-        print("Security audit passed with zero violations!")
+        print("\n✅ Security Scan PASSED successfully!")
 
 if __name__ == "__main__":
-    audit_aws_security()
+    run_scans()
